@@ -14,7 +14,8 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { DatabaseSync } = require('node:sqlite');
+const { DatabaseSync, constants } = require('node:sqlite');
+const crypto = require('node:crypto');
 
 const ALLOWED_ROOTS = ['/workspace', '/context', '/local'];
 const DEFAULT_BASE = '/workspace';
@@ -63,43 +64,98 @@ function resolveOutputPath(input) {
   if (typeof input !== 'string' || !input.trim()) throw new Error('缺少必填参数 outputPath');
   const abs = path.resolve(DEFAULT_BASE, input.trim());
   ensureInsideRoot(abs, 'outputPath');
-  if (abs.startsWith('/context')) throw new Error('outputPath 位于只读挂载 /context，无法写出');
+  writableOutputLocation(abs);
+  const parent = fs.realpathSync(path.dirname(abs)); writableOutputLocation(parent);
+  if (fs.existsSync(abs)) writableOutputLocation(fs.realpathSync(abs));
   return abs;
 }
 
-function firstVerb(sql) {
-  const s = String(sql || '')
-    .replace(/^\uFEFF/, '')
-    .replace(/^\s*--[^\n]*\n?/, '')
-    .trim();
-  const m = s.match(/^([A-Za-z]+)/);
-  return m ? m[1].toUpperCase() : '';
+// Tokens exclude quoted identifiers/strings, bind parameters and comments.
+// Preserve nesting so a subquery WHERE cannot authorize an unscoped outer write.
+function sqlTokens(sql) {
+  const source = String(sql), tokens = [];
+  if (source.includes("\x00")) throw new Error("SQL 包含 NUL 字符，未执行");
+  let depth = 0;
+  for (let i = 0; i < source.length;) {
+    const c = source[i], next = source[i + 1];
+    if (c === '-' && next === '-') { i += 2; while (i < source.length && source[i] !== '\n') i++; continue; }
+    if (c === '/' && next === '*') { const end = source.indexOf('*/', i + 2); i = end < 0 ? source.length : end + 2; continue; }
+    if (c === "'" || c === '"' || c === '`' || c === '[') {
+      const end = c === '[' ? ']' : c; i++;
+      while (i < source.length) {
+        if (source[i++] === end) { if (c !== '[' && source[i] === end) { i++; continue; } break; }
+      }
+      continue;
+    }
+    if (c === '?' || c === ':' || c === '$' || c === '@') {
+      i++; while (i < source.length && /[\w$\u0080-\uffff]/.test(source[i])) i++;
+      if (c === '$') {
+        while (source.slice(i, i+2) === '::') { i += 2; while (i < source.length && /[\w$\u0080-\uffff]/.test(source[i])) i++; }
+        if (source[i] === '(') { const end = source.indexOf(')', i+1); i = end < 0 ? source.length : end+1; }
+      }
+      continue;
+    }
+    if (c === '(') { depth++; i++; continue; }
+    if (c === ')') { depth--; i++; continue; }
+    if (c === ';') { tokens.push({word:';',depth}); i++; continue; }
+    if (/[A-Za-z_]/.test(c)) {
+      const start = i++; while (i < source.length && /[A-Za-z_0-9$]/.test(source[i])) i++;
+      tokens.push({word:source.slice(start,i).toUpperCase(),depth}); continue;
+    }
+    i++;
+  }
+  return tokens;
 }
+function firstVerb(sql) { return sqlTokens(sql).find(t => t.word !== ';')?.word || ''; }
 
-/* 危险写操作拦截：DROP / 无 WHERE 的 UPDATE|DELETE，需 confirm=true 放行。 */
 function checkDangerousWrite(sql, confirm) {
-  const up = String(sql).toUpperCase();
-  if (/\bDROP\s+(TABLE|INDEX|VIEW|TRIGGER|SCHEMA|DATABASE)\b/.test(up) && confirm !== true) {
-    throw new Error('危险操作被拦截：DROP 需要显式 confirm=true 确认后才执行');
+  if (confirm === true) return;
+  const tokens = sqlTokens(sql); let triggerHeader = false;
+  // One reverse pass avoids rescanning long malformed statements for each verb.
+  const futureWhere = new Set(), scopedWrites = new Set();
+  for (let i = tokens.length-1; i >= 0; i--) {
+    const t = tokens[i];
+    if (t.word === ';') futureWhere.clear();
+    else if (t.word === 'WHERE') futureWhere.add(t.depth);
+    else if (['UPDATE','DELETE'].includes(t.word) && futureWhere.has(t.depth)) scopedWrites.add(i);
   }
-  const stripped = up.replace(/--[^\n]*/g, '');
-  const w = stripped.match(/^(UPDATE|DELETE)\b/);
-  if (w && !/\bWHERE\b/.test(stripped) && confirm !== true) {
-    throw new Error(`危险操作被拦截：${w[1]} 缺少 WHERE 条件，需要显式 confirm=true 确认后才执行`);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i], word = token.word;
+    if (word === 'CREATE' && tokens.slice(i+1,i+4).some(t=>t.word==='TRIGGER')) triggerHeader = true;
+    if (triggerHeader && word === 'BEGIN') triggerHeader = false;
+    if (word === 'DROP' && ['TABLE','INDEX','VIEW','TRIGGER','SCHEMA','DATABASE'].includes(tokens[i+1]?.word)) {
+      throw new Error('危险操作被拦截：DROP 需要显式 confirm=true 确认后才执行');
+    }
+    if (!['UPDATE','DELETE'].includes(word) || triggerHeader || tokens[i-1]?.word === 'ON') continue;
+    if (!scopedWrites.has(i)) throw new Error(`危险操作被拦截：${word} 缺少 WHERE 条件，需要显式 confirm=true 确认后才执行`);
   }
 }
 
-/* ATTACH DATABASE：仅允许挂载根内的数据库文件，否则拒绝。 */
-function checkAttachInsideRoot(sql) {
-  if (!/\bATTACH\b/i.test(sql)) return;
-  let allowed = false;
-  const re = /'([^']*)'/g;
-  let m;
-  while ((m = re.exec(sql)) !== null) {
-    const abs = path.resolve(DEFAULT_BASE, m[1]);
-    try { ensureInsideRoot(abs); allowed = true; } catch (_) { /* 该候选越界 */ }
+function writableOutputLocation(abs) {
+  ensureInsideRoot(abs, 'outputPath');
+  if (abs === '/context' || abs.startsWith('/context/')) throw new Error('outputPath 位于只读挂载 /context，无法写出');
+}
+
+// Pin the already validated parent directory. Atomic publication replaces the
+// directory entry rather than following a raced destination symlink/hardlink.
+function writeCsvSafely(abs, text) {
+  const parent = fs.realpathSync(path.dirname(abs)); writableOutputLocation(parent);
+  const directory = fs.openSync(parent, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  let temporary = '';
+  try {
+    const pinned = `/proc/self/fd/${directory}`;
+    writableOutputLocation(fs.realpathSync(pinned));
+    const destination = path.join(pinned,path.basename(abs));
+    try { if (fs.lstatSync(destination).isSymbolicLink()) throw new Error('导出路径不得是符号链接'); }
+    catch (err) { if (err.code !== 'ENOENT') throw err; }
+    temporary = path.join(pinned,'.aide-sqlite-export-'+crypto.randomBytes(16).toString('hex'));
+    const fd = fs.openSync(temporary,fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,0o600);
+    try { fs.writeFileSync(fd,text); } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary,destination); temporary = '';
+  } finally {
+    if (temporary) { try { fs.unlinkSync(temporary); } catch (_) {} }
+    fs.closeSync(directory);
   }
-  if (!allowed) throw new Error('ATTACH DATABASE 被拦截：附加数据库路径不在允许的挂载根内');
 }
 
 /* ---------------- 数据规范化（防 BigInt 序列化崩溃） ---------------- */
@@ -179,6 +235,16 @@ function openDb(abs, readOnly, timeoutMs) {
     readBigInts: true,
     allowExtension: false, // 扩展加载默认禁用（双重保险）
   });
+  if (typeof db.setAuthorizer !== 'function' || !Number.isInteger(constants?.SQLITE_ATTACH) || !Number.isInteger(constants?.SQLITE_DENY)) { db.close(); throw new Error('SQLite 安全控制需要支持 DatabaseSync.setAuthorizer 的 Node.js（已验证 24.19.0）'); }
+  db.setAuthorizer((action, filename) => {
+    if (action !== constants.SQLITE_ATTACH) return constants.SQLITE_OK;
+    if (filename === ':memory:') return constants.SQLITE_OK;
+    // SQLite authorizes each actual ATTACH, including parameter/expression
+    // forms. Unknown dynamic filenames and file: URI options fail closed.
+    if (typeof filename !== 'string' || !filename || /^file:/i.test(filename)) return constants.SQLITE_DENY;
+    try { resolveDbPath(path.resolve(filename)); return constants.SQLITE_OK; }
+    catch (_) { return constants.SQLITE_DENY; }
+  });
   db.exec('PRAGMA busy_timeout = ' + Math.min(Number(timeoutMs) || DEFAULT_TIMEOUT_MS, 60000));
   db.exec('PRAGMA foreign_keys = ON');
   return db;
@@ -199,7 +265,6 @@ function handleQuery(args) {
   }
   if (!readonly) {
     checkDangerousWrite(sql, args.confirm);
-    checkAttachInsideRoot(sql);
   }
   const db = openDb(abs, readonly, timeout);
   try {
@@ -238,8 +303,7 @@ function handleTransaction(args) {
   if (args.readonly === true) throw new Error('事务包含写操作；readonly=true 时拒绝执行');
   for (const s of list) {
     if (!s || typeof s.sql !== 'string' || !s.sql.trim()) throw new Error('statements 中存在空 sql');
-    const v = firstVerb(s.sql);
-    if (WRITE_VERBS.has(v)) checkDangerousWrite(s.sql, args.confirm);
+    checkDangerousWrite(s.sql, args.confirm);
   }
   const db = openDb(abs, false, Number(args.timeout) || DEFAULT_TIMEOUT_MS);
   try {
@@ -279,7 +343,6 @@ function handleExecute(args) {
   if (!script.trim()) throw new Error('缺少必填参数 script');
   if (args.readonly === true) throw new Error('execute 为写操作；readonly=true 拒绝');
   checkDangerousWrite(script, args.confirm);
-  checkAttachInsideRoot(script);
   const db = openDb(abs, false, Number(args.timeout) || DEFAULT_TIMEOUT_MS);
   try {
     db.exec('BEGIN');
@@ -366,7 +429,7 @@ function handleExport(args) {
     const all = stmt.all();
     const cols = columnNames(stmt, all);
     const rows = all.slice(0, MAX_ROWS).map(r => sanitize(r));
-    fs.writeFileSync(out, toCsv(cols, rows));
+    writeCsvSafely(out, toCsv(cols, rows));
     auditWrite(abs, 'EXPORT_CSV', rows.length);
     return { format: 'csv', outputPath: out, columns: cols, rows: rows.length, truncated: all.length > rows.length };
   } finally {
