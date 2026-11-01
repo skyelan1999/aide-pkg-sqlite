@@ -1,0 +1,22 @@
+{
+  "stage": "reviewed local candidate, not published",
+  "plugin": "sqlite",
+  "version": "1.0.1",
+  "package": {
+    "file": "packages/v1.0.1/aide-pkg-sqlite-v1.0.1.zip",
+    "bytes": 15479,
+    "sha256": "641ed1d4d86e2a83482f93f2465b7803521dd0fbf077914da4f66a4bef04f789"
+  },
+  "runtime": "isolated Linux ARM64 / Node 24.19.0",
+  "sourceChecks": {
+    "CRUD": "33/33 pass",
+    "boundaryRegressions": "25/25 pass"
+  },
+  "hostInstall": "Actual Aide bundle upload and handler/native execution fixture passed; synthetic data only. Candidate catalog is explicitly not published; not a final Release receipt.",
+  "nativeCi": "Both native Linux architectures are required by the PR workflow before integration; see PR checks for current status.",
+  "limits": [
+    "No customer data, paid model or physical hardware",
+    "No production deployment",
+    "Final Aide Release still requires all 30 current public packages on both native architectures"
+  ]
+}

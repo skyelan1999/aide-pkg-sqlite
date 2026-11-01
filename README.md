@@ -1,6 +1,6 @@
 # SQLite · Aide 数据库插件
 
-Aide `sqlite` 插件的独立分发仓库，版本 **1.0.0**，MIT 许可。源码来自 [Aide f795a240](https://github.com/skyelan1999/aide/tree/f795a240cdb37e9b92a37d91664bd1bb3053b809/plugins/sqlite)。安装包与既有市场 1.0.0 ZIP 逐字节一致，保留代码、manifest 和测试。
+Aide `sqlite` 插件的独立分发仓库，版本 **1.0.1**，MIT 许可。源码来自 [Aide f795a240](https://github.com/skyelan1999/aide/tree/f795a240cdb37e9b92a37d91664bd1bb3053b809/plugins/sqlite)。1.0.1 修复多语句危险写确认、实际 ATTACH 授权和 CSV 路径边界；历史 1.0.0 ZIP 不覆盖。
 
 ## 工具与读写行为
 
@@ -27,12 +27,22 @@ Node 插件属于可信宿主代码，不是权限沙箱。SQLite 扩展加载�
 
 ## 安装
 
-从 [Release](https://github.com/skyelan1999/aide-pkg-sqlite/releases/tag/v1.0.0) 说明的固定提交链接下载 `aide-pkg-sqlite-v1.0.0.zip` 和 `SHA256SUMS`，运行 `sha256sum -c SHA256SUMS` 后通过 Aide 插件管理导入；也可在[官方市场](https://skyelan1999.github.io/aide-pkg-shop/)搜索 `sqlite`。已有同 ID、同版本无需重复安装。
+从 [Release](https://github.com/skyelan1999/aide-pkg-sqlite/releases/tag/v1.0.1) 说明的固定提交链接下载 `aide-pkg-sqlite-v1.0.1.zip` 和 `SHA256SUMS`，运行 `sha256sum -c SHA256SUMS` 后通过 Aide 插件管理导入；也可在[官方市场](https://skyelan1999.github.io/aide-pkg-shop/)搜索 `sqlite`。已有同 ID、同版本无需重复安装。
 
-文件由本仓库 `packages/v1.0.0/` 托管，Release 提供固定提交链接，不额外上传附件。市场分发相同字节的 ZIP。摘要用于完整性校验，不是发布者签名。
+文件由本仓库 `packages/v1.0.1/` 托管，Release 提供固定提交链接，不额外上传附件。市场分发相同字节的 ZIP。摘要用于完整性校验，不是发布者签名。
 
 ## 验证
 
 `node test.js` 运行既有 CRUD、事务提交/回滚、表结构、只读拒绝、危险语句、路径与扩展拒绝、参数绑定、截断、锁等待及导出回归。测试使用并删除 `/workspace/.sqltest`，运行前必须确认该目录不存在；不要在此路径存放用户数据。测试仅使用新建的样本数据库。
 
 发布还使用 Aide 宿主加载实际 ZIP 并调用工具，验证打包后仍可查询与执行事务；没有调用付费模型或访问用户数据库。
+
+## 1.0.1 的安全边界（Aide #583/#584/#586）
+
+1.0.1 安装包包含本节修复；公开发行状态应以 Release 页面为准。运行时需要 Linux 挂载根及 `/proc/self/fd`，并提供 `DatabaseSync.setAuthorizer` 的 Node.js（本次验证24.19.0）；缺少授权API时明确拒绝打开数据库。
+
+危险写检查逐条处理SQL，忽略字符串、标识符、参数名和注释；子查询中的WHERE不能授权无条件外层写，NUL输入拒绝。此确认检查仍不代替SQL审核或数据备份。每次实际ATTACH还由SQLite原生授权器校验；使用允许根内的绝对字面路径或`:memory:`，未知动态目标与`file:` URI拒绝；相对路径仅在SQLite实际工作目录仍属于允许根时接受。
+
+CSV导出验证实际父目录，持有目录句柄，在同目录生成0600临时文件后原子替换目标目录项，拒绝现有符号链接，并防止发布时新出现的链接指向外部文件。数据库本体与dump仍保留原有路径检查；本节不声称实现了所有文件操作的操作系统隔离。
+
+新增回归：`node --test security.test.cjs`。既有`node test.js`须使用隔离容器或确认其固定测试目录没有用户数据。

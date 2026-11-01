@@ -1,0 +1,31 @@
+name: Verify SQLite runtime
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: sqlite-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Prepare disposable plugin mount roots
+        run: sudo install -d -o "$USER" /workspace /context /local
+      - name: Execute CRUD and boundary regressions
+        run: |
+          node --version
+          node --check index.js
+          node test.js
+          node --test security.test.cjs
+          python3 scripts/package.py --check
