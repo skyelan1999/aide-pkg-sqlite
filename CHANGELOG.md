@@ -15,9 +15,9 @@
 - 补充各工具实际读写默认值、Node 运行依赖、固定挂载根与结果规模限制说明。
 
 
-## 1.0.3 — source candidate
+## 1.0.3 — 2026-11-12
 
 - Bind local relative files to the selected host workspace.
 - Add authorized SSH workspace/reference offline checkout, guarded host writeback and separate export target source.
 - Reject active WAL/journals and unstaged remote ATTACH targets; retain local direct-file behavior.
-- Node suites and exact candidate ZIP installation against dual OpenSSH hosts passed; publication and production installation are separate.
+- Node suites and exact candidate ZIP installation against dual OpenSSH hosts passed; requires Aide 0.1.19.0 RC1 for the new host paths; installed packages are updated separately.
