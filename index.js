@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const { DatabaseSync, constants } = require('node:sqlite');
 const crypto = require('node:crypto');
+const sourceScope = new (require('node:async_hooks').AsyncLocalStorage)();
 
 const ALLOWED_ROOTS = ['/workspace', '/context', '/local'];
 const DEFAULT_BASE = '/workspace';
@@ -41,7 +42,7 @@ function auditWrite(dbPath, op, changes) {
 }
 
 function ensureInsideRoot(p, label) {
-  for (const root of ALLOWED_ROOTS) {
+  for (const root of (sourceScope.getStore()?.roots || ALLOWED_ROOTS)) {
     if (p === root || p.startsWith(root + '/')) return;
   }
   throw new Error(`${label}路径越界：${p}（仅允许 ${ALLOWED_ROOTS.join('、')} 之内）`);
@@ -50,7 +51,7 @@ function ensureInsideRoot(p, label) {
 /* 解析并校验数据库文件路径：相对路径相对 /workspace 解析；拒绝越界与符号链接逃逸。 */
 function resolveDbPath(input) {
   if (typeof input !== 'string' || !input.trim()) throw new Error('缺少必填参数 db（数据库文件路径）');
-  const abs = path.resolve(DEFAULT_BASE, input.trim());
+  const abs = path.resolve(sourceScope.getStore()?.base || DEFAULT_BASE, input.trim());
   ensureInsideRoot(abs, 'db');
   // 符号链接逃逸检测：对已存在的目录与文件取真实路径后再次校验。
   const parent = path.dirname(abs);
@@ -62,7 +63,7 @@ function resolveDbPath(input) {
 /* 导出输出路径：同 resolveDbPath，但禁止写入只读挂载 /context。 */
 function resolveOutputPath(input) {
   if (typeof input !== 'string' || !input.trim()) throw new Error('缺少必填参数 outputPath');
-  const abs = path.resolve(DEFAULT_BASE, input.trim());
+  const abs = path.resolve(sourceScope.getStore()?.base || DEFAULT_BASE, input.trim());
   ensureInsideRoot(abs, 'outputPath');
   writableOutputLocation(abs);
   const parent = fs.realpathSync(path.dirname(abs)); writableOutputLocation(parent);
@@ -239,6 +240,8 @@ function openDb(abs, readOnly, timeoutMs) {
   db.setAuthorizer((action, filename) => {
     if (action !== constants.SQLITE_ATTACH) return constants.SQLITE_OK;
     if (filename === ':memory:') return constants.SQLITE_OK;
+    const scope=sourceScope.getStore();
+    if(scope?.remote && filename !== scope.output) return constants.SQLITE_DENY;
     // SQLite authorizes each actual ATTACH, including parameter/expression
     // forms. Unknown dynamic filenames and file: URI options fail closed.
     if (typeof filename !== 'string' || !filename || /^file:/i.test(filename)) return constants.SQLITE_DENY;
@@ -437,6 +440,35 @@ function handleExport(args) {
   }
 }
 
+// Remote SQLite is an offline file checkout, not a network database lock.
+// The host pins source identity, visibility and RW permission and owns cleanup.
+function invokeSource(args,api,handler,kind){
+  const remote = api && api.workspaceRoot === '';
+  if(!remote && !args.source){
+    if(api && (typeof api.workspaceRoot!=='string'||!path.isAbsolute(api.workspaceRoot)))throw Error('缺少调用绑定的本地工作区');
+    const base=api?.workspaceRoot||DEFAULT_BASE;
+    return sourceScope.run({base,roots:[...new Set([base,...ALLOWED_ROOTS])],remote:false},()=>handler(args));
+  }
+  return runSource(args,api,handler,kind);
+}
+async function runSource(args,api,handler,kind){
+  if(typeof api?.sources !== 'function') throw Error('当前宿主不支持受控远端数据库 checkout，请升级 Aide');
+  const write = kind==='transaction'||kind==='execute'||kind==='query'&&args.readonly===false;
+  const source=args.source||'workspace';
+  const db=await api.sources({operation:'checkout',source,path:args.db,slot:'db',write,allowCreate:write,sqlite:true});
+  const dbPath=path.join(db.workspace,db.path),roots=[path.dirname(dbPath)];
+  let output,outputPath;
+  if(kind==='export'){
+    output=await api.sources({operation:'checkout',source:args.outputSource||source,path:args.outputPath,slot:'output',write:true,allowCreate:true});
+    outputPath=path.join(output.workspace,output.path);roots.push(path.dirname(outputPath));
+  }
+  const result=sourceScope.run({roots,base:path.dirname(dbPath),output:outputPath,remote:true},()=>handler({...args,db:dbPath,...(output?{outputPath}:{})}));
+  const receipts=[];
+  if(write)receipts.push(await api.sources({operation:'commit',slot:'db'}));
+  if(output)receipts.push(await api.sources({operation:'commit',slot:'output'}));
+  return {...result,...(output?{outputPath:args.outputPath}:{}),source,checkout:{mode:'offline',receipts}};
+}
+
 /* ---------------- 插件导出（协议 v1.1） ---------------- */
 
 const p = { type: 'object', additionalProperties: true, description: '参数绑定：? 用数组，:name 用对象' };
@@ -444,8 +476,9 @@ const p = { type: 'object', additionalProperties: true, description: '参数绑�
 module.exports = {
   name: 'sqlite',
   apply(ctx) {
+    const register=tool=>{tool.parameters.properties.source={type:'string',description:'可选：宿主授权且 AI 可见的来源 ID；SSH 默认为 workspace，路径相对该来源'};if(tool.name==='sqlite_export')tool.parameters.properties.outputSource={type:'string',description:'导出目标来源 ID，必须可写'};ctx.tool(tool);};
     ctx.logger && ctx.logger.info && ctx.logger.info('SQLite 数据库插件已加载（node:sqlite，零依赖）');
-    ctx.tool({
+    register({
       name: 'sqlite_query',
       description: '对 SQLite 数据库执行一条参数化查询。SELECT/PRAGMA/EXPLAIN 返回 {columns,rows,rowCount,truncated}；INSERT/UPDATE/DELETE 返回 {changes,lastInsertRowid}；DDL 返回 {changes}。默认只读，写操作需显式 readonly=false。',
       parameters: {
@@ -460,9 +493,9 @@ module.exports = {
           confirm: { type: 'boolean', description: '危险写操作（DROP、无 WHERE 的 UPDATE/DELETE）需 true 确认' },
         },
       },
-      handler: args => handleQuery(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleQuery,'query'),
     });
-    ctx.tool({
+    register({
       name: 'sqlite_transaction',
       description: '在单个事务内顺序执行多条语句：BEGIN → 逐条 → COMMIT；任一失败自动 ROLLBACK。返回 {committed,results,changes,lastInsertRowid}。默认可写（readonly=false）。',
       parameters: {
@@ -482,9 +515,9 @@ module.exports = {
           confirm: { type: 'boolean', description: '危险语句需 true 确认' },
         },
       },
-      handler: args => handleTransaction(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleTransaction,'transaction'),
     });
-    ctx.tool({
+    register({
       name: 'sqlite_execute',
       description: '在事务内执行多语句脚本/迁移（db.exec），任一失败整体回滚。返回 {changes, executedStatements}。',
       parameters: {
@@ -497,9 +530,9 @@ module.exports = {
           confirm: { type: 'boolean', description: 'DROP / 无 WHERE 语句需 true 确认' },
         },
       },
-      handler: args => handleExecute(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleExecute,'execute'),
     });
-    ctx.tool({
+    register({
       name: 'sqlite_tables',
       description: '列出数据库中的表与视图（查询 sqlite_master）。只读。',
       parameters: {
@@ -509,9 +542,9 @@ module.exports = {
           readonly: { type: 'boolean', description: '默认 true' },
         },
       },
-      handler: args => handleTables(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleTables,'tables'),
     });
-    ctx.tool({
+    register({
       name: 'sqlite_schema',
       description: '查看单表结构：建表 SQL、列（PRAGMA table_info）、索引（PRAGMA index_list）、外键（PRAGMA foreign_key_list）。只读。',
       parameters: {
@@ -522,9 +555,9 @@ module.exports = {
           readonly: { type: 'boolean', description: '默认 true' },
         },
       },
-      handler: args => handleSchema(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleSchema,'schema'),
     });
-    ctx.tool({
+    register({
       name: 'sqlite_export',
       description: '导出数据库。format=csv：对 query 结果导出 CSV 到 outputPath；format=dump：VACUUM INTO 生成一致性副本。outputPath 限挂载根内且不可写在只读 /context。',
       parameters: {
@@ -537,7 +570,7 @@ module.exports = {
           timeout: { type: 'number', description: 'busy_timeout 毫秒，默认 5000' },
         },
       },
-      handler: args => handleExport(args || {}),
+      handler: (args,api) => invokeSource(args || {},api,handleExport,'export'),
     });
     ctx.provide && ctx.provide('sqlite');
   },

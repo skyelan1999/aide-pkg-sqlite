@@ -1,8 +1,8 @@
 {
   "id": "sqlite",
   "name": "SQLite 数据库",
-  "description": "读写 SQLite 数据库文件（参数化查询、事务、schema、导出）；零第三方依赖，基于 node:sqlite，默认只读",
-  "version": "1.0.1",
+  "description": "SQLite 数据库查询、事务及导出；支持宿主授权的本地文件和停写状态的 SSH 文件快照",
+  "version": "1.0.3",
   "author": "aide",
   "main": "index.js",
   "enabled": true,

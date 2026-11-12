@@ -15,7 +15,7 @@ name='aide-pkg-sqlite-v'+version+'.zip'
 output=root/'packages'/('v'+version)
 buffer=io.BytesIO()
 with zipfile.ZipFile(buffer,'w') as bundle:
-    for source in ('LICENSE','index.js','manifest.json','test.js','security.test.cjs'):
+    for source in ('LICENSE','index.js','manifest.json','test.js','security.test.cjs','sources.test.cjs'):
         item=zipfile.ZipInfo(source,(2026,1,1,0,0,0))
         item.compress_type=zipfile.ZIP_DEFLATED
         item.external_attr=0o100644<<16

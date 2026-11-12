@@ -13,3 +13,11 @@
 - 将 Aide 已有 SQLite 插件独立分发，保留 MIT 许可。
 - 保留原代码、manifest、测试与安装 ZIP 字节内容。
 - 补充各工具实际读写默认值、Node 运行依赖、固定挂载根与结果规模限制说明。
+
+
+## 1.0.3 — source candidate
+
+- Bind local relative files to the selected host workspace.
+- Add authorized SSH workspace/reference offline checkout, guarded host writeback and separate export target source.
+- Reject active WAL/journals and unstaged remote ATTACH targets; retain local direct-file behavior.
+- Node suites and exact candidate ZIP installation against dual OpenSSH hosts passed; publication and production installation are separate.

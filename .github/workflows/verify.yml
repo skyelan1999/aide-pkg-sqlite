@@ -27,5 +27,5 @@ jobs:
           node --version
           node --check index.js
           node test.js
-          node --test security.test.cjs
+          node --test security.test.cjs sources.test.cjs
           python3 scripts/package.py --check
